@@ -137,6 +137,19 @@ app.get("/media", async (req, res) => {
     res.status(500).send("media error");
   }
 });
+// rota para receber webhooks da Z-API
+app.post("/webhook/zapi", (req, res) => {
+  console.log("Webhook recebido:", req.body);  // log no Vercel
+  res.json({ ok: true });
+
+  // exemplo: salvar em memória (só teste)
+  global.lastMessage = req.body;
+});
+
+// rota debug para ver última mensagem recebida
+app.get("/debug-last", (req, res) => {
+  res.json(global.lastMessage || { info: "nenhum webhook ainda" });
+});
 
 export default app;
 
