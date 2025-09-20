@@ -9,17 +9,16 @@ app.use(express.json({ limit: "10mb" }));
 app.use(express.urlencoded({ extended: true, limit: "10mb" }));
 
 // ===== ENV =====
-const ZAPI_BASE  = process.env.ZAPI_BASE || "";
-const ZAPI_TOKEN = process.env.ZAPI_TOKEN || "";
-const AUTH_TOKEN = process.env.AUTH_TOKEN || "";
-const READ_ONLY  = process.env.READ_ONLY === "1";
+const ZAPI_BASE  = process.env.ZAPI_BASE || "";  // opcional (para avatar via Z-API)
+const ZAPI_TOKEN = process.env.ZAPI_TOKEN || ""; // opcional (para avatar via Z-API)
+const AUTH_TOKEN = process.env.AUTH_TOKEN || ""; // opcional (para rotas protegidas)
+const READ_ONLY  = process.env.READ_ONLY === "1"; // não usado aqui, mas deixei para futuro
 
-// ===== Memória =====
+// ===== Memória (APENAS nesta execução) =====
 const Chats = new Map();     // chatId -> { chatId, name, phone, lastTs, avatarUrl, preview }
 const Messages = new Map();  // chatId -> [ { id, fromMe, type, text, mediaUrl, ts } ]
-let LAST_HOOK = null;
+let LAST_HOOK = null;        // último payload bruto recebido (debug)
 
-// utilidades in-memory
 function upsertChat({ chatId, name, phone, ts, avatarUrl, preview }) {
   const prev = Chats.get(chatId) || { chatId };
   Chats.set(chatId, {
@@ -35,7 +34,7 @@ function upsertChat({ chatId, name, phone, ts, avatarUrl, preview }) {
 function pushMessage(chatId, msg) {
   if (!Messages.has(chatId)) Messages.set(chatId, []);
   const arr = Messages.get(chatId);
-  if (arr.find(x => x.id === msg.id)) return; // idempotência
+  if (arr.find(x => x.id === msg.id)) return; // evita duplicar
   arr.unshift(msg); // mais novas primeiro
 }
 
@@ -48,7 +47,7 @@ function requireAuth(req, res, next) {
 // ===== Health =====
 app.get("/health", (req, res) => res.json({ ok: true }));
 
-// ===== Normalizador (abrangente) =====
+// ===== Normalizador de payloads (abrangente) =====
 function normalizeIncoming(b) {
   if (!b) return [];
   if (typeof b === "string") {
@@ -67,7 +66,7 @@ function normalizeIncoming(b) {
     return [b];
   }
 
-  // varredura recursiva — acha objetos que parecem mensagem
+  // varredura recursiva — acha objetos com id + conteúdo
   const out = [];
   (function walk(x) {
     if (!x || typeof x !== "object") return;
@@ -86,10 +85,10 @@ function normalizeIncoming(b) {
   return out;
 }
 
-// ===== Webhook (aceita GET/POST, com/sem barra) =====
+// ===== Webhook (aceita GET/POST; com ou sem barra) =====
 app.all(/^\/webhook\/zapi\/?$/, (req, res) => {
   try {
-    // guarda último payload bruto p/ debug
+    // guarda último payload para debug
     LAST_HOOK = {
       method: req.method,
       headers: req.headers,
@@ -97,7 +96,7 @@ app.all(/^\/webhook\/zapi\/?$/, (req, res) => {
       body: (typeof req.body === "string" ? req.body : (req.body || null)),
     };
 
-    // corpo possivelmente em string (form) -> tenta parse
+    // se vier como string (form), tenta parsear
     let body = LAST_HOOK.body;
     if (typeof body === "string") {
       try { body = JSON.parse(body); } catch {}
@@ -106,10 +105,10 @@ app.all(/^\/webhook\/zapi\/?$/, (req, res) => {
     const incoming = normalizeIncoming(body || {});
 
     for (const m of incoming) {
-      // 1) tipo "cru" da Z-API
+      // tipo "cru" da Z-API
       const rawType = String(m.type || m.messageType || "").trim();
 
-      // 2) ignorar eventos que não são conteúdo (status, presença, typing…)
+      // ignorar eventos sem conteúdo (status/presença/typing/acks)
       if (
         /StatusCallback/i.test(rawType) ||
         /Presence/i.test(rawType) ||
@@ -121,7 +120,7 @@ app.all(/^\/webhook\/zapi\/?$/, (req, res) => {
         continue;
       }
 
-      // 3) montar chatId (usa chatId/from/... ou deriva do phone)
+      // chatId (usa chatId/from/... ou deriva do phone)
       let chatId =
         m.chatId || m.from || m.jid || m.remoteJid ||
         (m.phone ? `${String(m.phone).replace(/\D/g, "")}@c.us` : null);
@@ -129,17 +128,17 @@ app.all(/^\/webhook\/zapi\/?$/, (req, res) => {
 
       const phone = (typeof chatId === "string" ? chatId.split("@")[0] : "") || (m.phone || "");
 
-      // 4) nome/avatar
+      // nome / avatar
       const name  = m.senderName || m.chatName || m.name || phone;
       const avatarUrl = m.senderPhoto || m.photo || m.profilePicUrl || m.avatarUrl || null;
 
-      // 5) timestamp
+      // timestamp
       const ts =
         (m.moment && Number(m.moment)) ||
         (m.timestamp && Number(m.timestamp) * 1000) ||
         Date.now();
 
-      // 6) tipo + texto
+      // tipo + texto
       let type =
         rawType === "ReceivedCallback" ? "chat" :
         m.messageType || rawType || (m.imageUrl ? "image" : "chat");
@@ -151,7 +150,7 @@ app.all(/^\/webhook\/zapi\/?$/, (req, res) => {
 
       const mediaUrl = m.mediaUrl || m.imageUrl || m.documentUrl || null;
 
-      // 7) preview + upsert
+      // preview + upsert chat
       const previewText = text || (mediaUrl ? `[${type}]` : "");
       upsertChat({
         chatId,
@@ -162,25 +161,35 @@ app.all(/^\/webhook\/zapi\/?$/, (req, res) => {
         preview: { type, text: previewText }
       });
 
-      // 8) salvar mensagem
+      // salva mensagem
       const id = m.id || m.messageId || m.key?.id || `${chatId}-${ts}`;
       pushMessage(chatId, { id, chatId, fromMe: !!m.fromMe, type, text, mediaUrl, ts });
     }
 
-    res.json({ ok: true, received: Array.isArray(incoming) ? incoming.length : 0 });
+    // resposta
+    const payload = { ok: true, received: Array.isArray(incoming) ? incoming.length : 0 };
+
+    // se chamar com ?echo=1, devolve threads + primeiras msgs do snapshot desta execução
+    if (String(req.query.echo || "") === "1") {
+      payload.threads = [...Chats.values()];
+      payload.messages = Object.fromEntries(
+        [...Messages.entries()].map(([k, v]) => [k, v.slice(0, 5)])
+      );
+    }
+
+    res.json(payload);
   } catch (e) {
     console.error("Webhook error:", e);
-    // não retornar 500 para não gerar retries em loop
     res.json({ ok: true, handled: false });
   }
 });
 
-// ===== Debug do último payload =====
+// ===== Debug do último payload recebido =====
 app.get("/debug-last", (req, res) => {
   res.json(LAST_HOOK || { info: "nenhum webhook ainda" });
 });
 
-// ===== Threads =====
+// ===== Threads (somente o que estiver em memória nesta execução) =====
 app.get("/threads", (req, res) => {
   const out = [...Chats.values()]
     .sort((a, b) => (b.lastTs || 0) - (a.lastTs || 0))
@@ -206,7 +215,7 @@ app.get("/threads", (req, res) => {
   res.json(out);
 });
 
-// ===== Messages (paginado) =====
+// ===== Messages (paginado; memória desta execução) =====
 app.get("/messages", (req, res) => {
   const { chatId, cursor = "0", pageSize = "50" } = req.query;
   const all = Messages.get(chatId) || [];
@@ -217,7 +226,7 @@ app.get("/messages", (req, res) => {
   res.json({ items: slice, nextCursor });
 });
 
-// ===== Media proxy =====
+// ===== Media proxy (para exibir imagens/avatares via proxy) =====
 app.get("/media", async (req, res) => {
   try {
     const { url } = req.query;
@@ -241,3 +250,4 @@ if (process.env.NODE_ENV !== "production") {
   const port = process.env.PORT || 3000;
   app.listen(port, () => console.log("API on http://localhost:" + port));
 }
+
