@@ -3,24 +3,21 @@
 import express from "express";
 import cors from "cors";
 
-// --------- App base ----------
 const app = express();
 app.use(cors());
-
-// aceita JSON e x-www-form-urlencoded (alguns provedores usam form)
 app.use(express.json({ limit: "10mb" }));
 app.use(express.urlencoded({ extended: true, limit: "10mb" }));
 
-// --------- ENV ----------
-const ZAPI_BASE  = process.env.ZAPI_BASE || "";      // ex: https://api.z-api.io/instances/SEU_INSTANCE_ID
+// ===== ENV =====
+const ZAPI_BASE  = process.env.ZAPI_BASE || "";
 const ZAPI_TOKEN = process.env.ZAPI_TOKEN || "";
-const AUTH_TOKEN = process.env.AUTH_TOKEN || "";      // protege rotas /backfill e /send
-const READ_ONLY  = process.env.READ_ONLY === "1";     // "1" => desabilita /send
+const AUTH_TOKEN = process.env.AUTH_TOKEN || "";
+const READ_ONLY  = process.env.READ_ONLY === "1";
 
-// --------- Memória (ok p/ começar) ----------
+// ===== Memória =====
 const Chats = new Map();     // chatId -> { chatId, name, phone, lastTs, avatarUrl, preview }
 const Messages = new Map();  // chatId -> [ { id, fromMe, type, text, mediaUrl, ts } ]
-let LAST_HOOK = null;        // payload bruto do último webhook (debug)
+let LAST_HOOK = null;
 
 function upsertChat({ chatId, name, phone, ts, avatarUrl, preview }) {
   const prev = Chats.get(chatId) || { chatId };
@@ -37,8 +34,7 @@ function upsertChat({ chatId, name, phone, ts, avatarUrl, preview }) {
 function pushMessage(chatId, msg) {
   if (!Messages.has(chatId)) Messages.set(chatId, []);
   const arr = Messages.get(chatId);
-  // idempotência
-  if (arr.find(x => x.id === msg.id)) return;
+  if (arr.find(x => x.id === msg.id)) return; // idempotência
   arr.unshift(msg); // mais novas primeiro
 }
 
@@ -48,11 +44,11 @@ function requireAuth(req, res, next) {
   return res.status(401).json({ ok: false, error: "unauthorized" });
 }
 
-// --------- Health ----------
+// ===== Health =====
 app.get("/health", (req, res) => res.json({ ok: true }));
 
-// --------- Normalizador de payloads ----------
-function normalizeIncoming(b) {function normalizeIncoming(b) {
+// ===== Normalizador (abrangente) =====
+function normalizeIncoming(b) {
   if (!b) return [];
   if (typeof b === "string") {
     try { b = JSON.parse(b); } catch {}
@@ -65,17 +61,16 @@ function normalizeIncoming(b) {function normalizeIncoming(b) {
   if (b.chatId && (b.body || b.text || b.caption || b.imageUrl || b.documentUrl)) return [b];
   if (b.msg && (b.msg.chatId || b.msg.from)) return [b.msg];
 
-  // callbacks da Z-API (phone + text.message)
+  // callbacks Z-API (phone + text.message)
   if (b.type === "ReceivedCallback" || b.phone || (b.text && typeof b.text === "object")) {
     return [b];
   }
 
-  // varredura recursiva: acha objetos com id + conteúdo
+  // varredura recursiva
   const out = [];
   (function walk(x) {
     if (!x || typeof x !== "object") return;
-    const hasId =
-      x.chatId || x.from || x.jid || x.remoteJid || x.phone;
+    const hasId = x.chatId || x.from || x.jid || x.remoteJid || x.phone;
     const hasContent =
       x.body ||
       typeof x.text === "string" ||
@@ -90,10 +85,9 @@ function normalizeIncoming(b) {function normalizeIncoming(b) {
   return out;
 }
 
-// --------- Webhook robusto (aceita GET/POST, com/sem / no fim) ----------
+// ===== Webhook (aceita GET/POST, com/sem barra) =====
 app.all(/^\/webhook\/zapi\/?$/, (req, res) => {
   try {
-    // guarda último payload bruto p/ debug
     LAST_HOOK = {
       method: req.method,
       headers: req.headers,
@@ -101,60 +95,66 @@ app.all(/^\/webhook\/zapi\/?$/, (req, res) => {
       body: (typeof req.body === "string" ? req.body : (req.body || null)),
     };
 
-    // corpo possivelmente em string (form) -> tenta parse
     let body = LAST_HOOK.body;
     if (typeof body === "string") {
       try { body = JSON.parse(body); } catch {}
     }
 
     const incoming = normalizeIncoming(body || {});
-    for (const m of incoming) {for (const m of incoming) {
-  // chatId: usa chatId/from/jid… ou deriva do phone
-  let chatId =
-    m.chatId || m.from || m.jid || m.remoteJid ||
-    (m.phone ? `${String(m.phone).replace(/\D/g, "")}@c.us` : null);
-  if (!chatId) continue;
 
-  const phone = (typeof chatId === "string" ? chatId.split("@")[0] : "") || (m.phone || "");
+    for (const m of incoming) {
+      // chatId: usa chatId/from/jid… ou deriva do phone
+      let chatId =
+        m.chatId || m.from || m.jid || m.remoteJid ||
+        (m.phone ? `${String(m.phone).replace(/\D/g, "")}@c.us` : null);
+      if (!chatId) continue;
 
-  // nome e avatar
-  const name  = m.senderName || m.chatName || m.name || phone;
-  const avatarUrl = m.senderPhoto || m.photo || m.profilePicUrl || m.avatarUrl || null;
+      const phone = (typeof chatId === "string" ? chatId.split("@")[0] : "") || (m.phone || "");
 
-  // timestamp
-  const ts =
-    (m.moment && Number(m.moment)) ||
-    (m.timestamp && Number(m.timestamp) * 1000) ||
-    Date.now();
+      // nome e avatar
+      const name  = m.senderName || m.chatName || m.name || phone;
+      const avatarUrl = m.senderPhoto || m.photo || m.profilePicUrl || m.avatarUrl || null;
 
-  // tipo + texto
-  let type =
-    m.type === "ReceivedCallback" ? "chat" :
-    m.messageType || m.type || (m.imageUrl ? "image" : "chat");
+      // timestamp
+      const ts =
+        (m.moment && Number(m.moment)) ||
+        (m.timestamp && Number(m.timestamp) * 1000) ||
+        Date.now();
 
-  let text =
-    m.body ||
-    (typeof m.text === "string" ? m.text : (m.text?.message || m.text?.caption || "")) ||
-    m.caption || "";
+      // tipo + texto
+      let type =
+        m.type === "ReceivedCallback" ? "chat" :
+        m.messageType || m.type || (m.imageUrl ? "image" : "chat");
 
-  const mediaUrl = m.mediaUrl || m.imageUrl || m.documentUrl || null;
+      let text =
+        m.body ||
+        (typeof m.text === "string" ? m.text : (m.text?.message || m.text?.caption || "")) ||
+        m.caption || "";
 
-  const previewText =
-    type === "chat" ? (text || "").slice(0, 120) : `[${type}] ${(text || "").slice(0, 80)}`;
+      const mediaUrl = m.mediaUrl || m.imageUrl || m.documentUrl || null;
 
-  upsertChat({ chatId, name, phone, ts, avatarUrl, preview: { type, text: previewText } });
+      const previewText =
+        type === "chat" ? (text || "").slice(0, 120) : `[${type}] ${(text || "").slice(0, 80)}`;
 
-  const id = m.id || m.messageId || m.key?.id || `${chatId}-${ts}`;
-  pushMessage(chatId, { id, chatId, fromMe: !!m.fromMe, type, text, mediaUrl, ts });
+      upsertChat({ chatId, name, phone, ts, avatarUrl, preview: { type, text: previewText } });
+
+      const id = m.id || m.messageId || m.key?.id || `${chatId}-${ts}`;
+      pushMessage(chatId, { id, chatId, fromMe: !!m.fromMe, type, text, mediaUrl, ts });
+    }
+
+    res.json({ ok: true, received: Array.isArray(incoming) ? incoming.length : 0 });
+  } catch (e) {
+    console.error("Webhook error:", e);
+    res.json({ ok: true, handled: false });
   }
 });
 
-// --------- Debug: ver último payload recebido ----------
+// ===== Debug último payload =====
 app.get("/debug-last", (req, res) => {
   res.json(LAST_HOOK || { info: "nenhum webhook ainda" });
 });
 
-// --------- Threads (lista de conversas) ----------
+// ===== Threads =====
 app.get("/threads", (req, res) => {
   const out = [...Chats.values()]
     .sort((a, b) => (b.lastTs || 0) - (a.lastTs || 0))
@@ -164,7 +164,6 @@ app.get("/threads", (req, res) => {
       if (c.avatarUrl) {
         avatar = { type: "proxy", url: c.avatarUrl };
       } else if (phone && ZAPI_BASE && ZAPI_TOKEN) {
-        // tenta foto via Z-API (alguns planos expõem esse endpoint)
         const pic = `${ZAPI_BASE}/profile-pic?token=${ZAPI_TOKEN}&phone=${phone}`;
         avatar = { type: "proxy", url: pic };
       }
@@ -181,7 +180,7 @@ app.get("/threads", (req, res) => {
   res.json(out);
 });
 
-// --------- Messages (histórico paginado) ----------
+// ===== Messages (paginado) =====
 app.get("/messages", (req, res) => {
   const { chatId, cursor = "0", pageSize = "50" } = req.query;
   const all = Messages.get(chatId) || [];
@@ -192,7 +191,7 @@ app.get("/messages", (req, res) => {
   res.json({ items: slice, nextCursor });
 });
 
-// --------- Media proxy (imagens/avatares) ----------
+// ===== Proxy de mídia =====
 app.get("/media", async (req, res) => {
   try {
     const { url } = req.query;
@@ -208,97 +207,7 @@ app.get("/media", async (req, res) => {
   }
 });
 
-// --------- Helpers Z-API (para backfill) ----------
-async function zGetJson(url) {
-  const r = await fetch(url);
-  let body = null;
-  try { body = await r.json(); } catch {}
-  if (!r.ok) {
-    const info = body ? JSON.stringify(body) : (await r.text().catch(()=>"(no body)"));
-    throw new Error(`ZAPI ${r.status} ${info}`);
-  }
-  return body;
-}
-
-async function fetchAllChats() {
-  if (!ZAPI_BASE || !ZAPI_TOKEN) return [];
-  const token = `token=${ZAPI_TOKEN}`;
-  const endpoints = [
-    `${ZAPI_BASE}/chats?${token}`,
-    `${ZAPI_BASE}/client/chats?${token}`,
-    `${ZAPI_BASE}/contacts?${token}`,
-  ];
-  for (const url of endpoints) {
-    try {
-      const data = await zGetJson(url);
-      const arr = Array.isArray(data) ? data : (data.chats || data.contacts || data.items || []);
-      if (Array.isArray(arr)) return arr;
-    } catch {/* tenta o próximo */}
-  }
-  return [];
-}
-
-async function fetchMessagesForChat(chatId, limit = 200, cursor = null) {
-  if (!ZAPI_BASE || !ZAPI_TOKEN) return { messages: [], nextCursor: null };
-  const token = `token=${ZAPI_TOKEN}`;
-  const qs = `${token}&chatId=${encodeURIComponent(chatId)}&limit=${limit}${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""}`;
-  const endpoints = [
-    `${ZAPI_BASE}/messages?${qs}`,
-    `${ZAPI_BASE}/client/messages?${qs}`,
-  ];
-  for (const url of endpoints) {
-    try {
-      const data = await zGetJson(url);
-      const messages = Array.isArray(data) ? data : (data.messages || data.items || []);
-      const nextCursor = data.nextCursor || null;
-      return { messages, nextCursor };
-    } catch {/* tenta o próximo */}
-  }
-  return { messages: [], nextCursor: null };
-}
-
-// --------- Backfill (puxa histórico) ----------
-app.post("/backfill", requireAuth, async (req, res) => {
-  try {
-    if (!ZAPI_BASE || !ZAPI_TOKEN) {
-      return res.status(500).json({ ok: false, error: "Missing ZAPI_BASE or ZAPI_TOKEN" });
-    }
-    const chats = await fetchAllChats(); // pode vir vazio em alguns planos
-    for (const c of chats) {
-      const chatId = c.id || c.chatId || c.jid;
-      if (!chatId) continue;
-
-      const phone = c.phone || (typeof chatId === "string" ? chatId.split("@")[0] : "");
-      const name  = c.name || c.pushname || phone;
-      const avatarUrl = c.profilePicUrl || c.avatarUrl || null;
-      upsertChat({ chatId, name, phone, ts: Date.now(), avatarUrl });
-
-      let cursor = null;
-      do {
-        const page = await fetchMessagesForChat(chatId, 200, cursor);
-        for (const m of page.messages) {
-          const id   = m.id || m.key?.id || `${chatId}-${m.timestamp || Date.now()}`;
-          const type = m.type || m.messageType || (m.imageUrl ? "image" : "chat");
-          const text = m.body || m.text || m.caption || "";
-          const mediaUrl = m.mediaUrl || m.imageUrl || m.documentUrl || null;
-          const ts   = (Number(m.timestamp || m.t) * 1000) || Date.now();
-
-          pushMessage(chatId, { id, chatId, fromMe: !!m.fromMe, type, text, mediaUrl, ts });
-
-          const previewText = (type === "chat") ? (text || "").slice(0,120) : `[${type}] ${(text || "").slice(0,80)}`;
-          upsertChat({ chatId, name, phone, ts, preview: { type, text: previewText } });
-        }
-        cursor = page.nextCursor || null;
-      } while (cursor);
-    }
-    res.json({ ok: true, chats: Chats.size });
-  } catch (e) {
-    console.error("Backfill error:", e);
-    res.status(500).json({ ok: false, error: String(e) });
-  }
-});
-
-// --------- Export para Vercel ---------
+// ===== Export Vercel =====
 export default app;
 
 // Dev local (opcional)
