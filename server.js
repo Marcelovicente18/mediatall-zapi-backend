@@ -12,12 +12,12 @@ app.use(express.urlencoded({ extended: true, limit: "10mb" }));
 const ZAPI_BASE  = process.env.ZAPI_BASE || "";  // opcional (para avatar via Z-API)
 const ZAPI_TOKEN = process.env.ZAPI_TOKEN || ""; // opcional (para avatar via Z-API)
 const AUTH_TOKEN = process.env.AUTH_TOKEN || ""; // opcional (para rotas protegidas)
-const READ_ONLY  = process.env.READ_ONLY === "1"; // não usado aqui, mas deixei para futuro
+const READ_ONLY  = process.env.READ_ONLY === "1"; // reservado para futuro
 
-// ===== Memória (APENAS nesta execução) =====
+// ===== Memória (só nesta execução) =====
 const Chats = new Map();     // chatId -> { chatId, name, phone, lastTs, avatarUrl, preview }
-const Messages = new Map();  // chatId -> [ { id, fromMe, type, text, mediaUrl, ts } ]
-let LAST_HOOK = null;        // último payload bruto recebido (debug)
+const Messages = new Map();  // chatId -> [ { id, chatId, fromMe, type, text, mediaUrl, ts } ]
+let LAST_HOOK = null;        // último payload bruto (debug)
 
 function upsertChat({ chatId, name, phone, ts, avatarUrl, preview }) {
   const prev = Chats.get(chatId) || { chatId };
@@ -34,7 +34,7 @@ function upsertChat({ chatId, name, phone, ts, avatarUrl, preview }) {
 function pushMessage(chatId, msg) {
   if (!Messages.has(chatId)) Messages.set(chatId, []);
   const arr = Messages.get(chatId);
-  if (arr.find(x => x.id === msg.id)) return; // evita duplicar
+  if (arr.find(x => x.id === msg.id)) return; // idempotência
   arr.unshift(msg); // mais novas primeiro
 }
 
@@ -47,7 +47,7 @@ function requireAuth(req, res, next) {
 // ===== Health =====
 app.get("/health", (req, res) => res.json({ ok: true }));
 
-// ===== Normalizador de payloads (abrangente) =====
+// ===== Normalizador =====
 function normalizeIncoming(b) {
   if (!b) return [];
   if (typeof b === "string") {
@@ -58,15 +58,17 @@ function normalizeIncoming(b) {
   if (b.type === "message" && b.message) return [b.message];
   if (Array.isArray(b.messages)) return b.messages;
   if (b.event === "message" && b.data) return Array.isArray(b.data) ? b.data : [b.data];
+
+  // registro simples (um único objeto com conteúdo)
   if (b.chatId && (b.body || b.text || b.caption || b.imageUrl || b.documentUrl)) return [b];
   if (b.msg && (b.msg.chatId || b.msg.from)) return [b.msg];
 
-  // callbacks Z-API (muito comuns): phone + text.message
+  // callbacks Z-API mais comuns
   if (b.type === "ReceivedCallback" || b.phone || (b.text && typeof b.text === "object")) {
     return [b];
   }
 
-  // varredura recursiva — acha objetos com id + conteúdo
+  // varredura recursiva
   const out = [];
   (function walk(x) {
     if (!x || typeof x !== "object") return;
@@ -85,7 +87,7 @@ function normalizeIncoming(b) {
   return out;
 }
 
-// ===== Webhook (aceita GET/POST; com ou sem barra) =====
+// ===== Webhook (aceita GET/POST, com/sem barra) =====
 app.all(/^\/webhook\/zapi\/?$/, (req, res) => {
   try {
     // guarda último payload para debug
@@ -105,18 +107,11 @@ app.all(/^\/webhook\/zapi\/?$/, (req, res) => {
     const incoming = normalizeIncoming(body || {});
 
     for (const m of incoming) {
-      // tipo "cru" da Z-API
+      // tipo "cru" (Z-API costuma mandar ReceivedCallback / MessageStatusCallback ...)
       const rawType = String(m.type || m.messageType || "").trim();
 
-      // ignorar eventos sem conteúdo (status/presença/typing/acks)
-      if (
-        /StatusCallback/i.test(rawType) ||
-        /Presence/i.test(rawType) ||
-        /Typing/i.test(rawType) ||
-        /Ack/i.test(rawType) ||
-        /Read/i.test(rawType) ||
-        /Delivered/i.test(rawType)
-      ) {
+      // Ignorar SOMENTE eventos que nunca carregam conteúdo de usuário
+      if (/MessageStatusCallback|Presence|Typing/i.test(rawType)) {
         continue;
       }
 
@@ -169,12 +164,18 @@ app.all(/^\/webhook\/zapi\/?$/, (req, res) => {
     // resposta
     const payload = { ok: true, received: Array.isArray(incoming) ? incoming.length : 0 };
 
-    // se chamar com ?echo=1, devolve threads + primeiras msgs do snapshot desta execução
+    // se chamar com ?echo=1, devolve threads + mensagens + debug desta execução
     if (String(req.query.echo || "") === "1") {
       payload.threads = [...Chats.values()];
       payload.messages = Object.fromEntries(
         [...Messages.entries()].map(([k, v]) => [k, v.slice(0, 5)])
       );
+      // DEBUG extra para entendermos o que foi interpretado e salvo
+      payload.debug = {
+        incomingRawType: incoming.map(m => m?.type || m?.messageType || null),
+        chatsKeys: [...Chats.keys()],
+        messagesKeys: [...Messages.keys()],
+      };
     }
 
     res.json(payload);
@@ -184,12 +185,12 @@ app.all(/^\/webhook\/zapi\/?$/, (req, res) => {
   }
 });
 
-// ===== Debug do último payload recebido =====
+// ===== Debug do último payload =====
 app.get("/debug-last", (req, res) => {
   res.json(LAST_HOOK || { info: "nenhum webhook ainda" });
 });
 
-// ===== Threads (somente o que estiver em memória nesta execução) =====
+// ===== Threads (snapshot desta execução) =====
 app.get("/threads", (req, res) => {
   const out = [...Chats.values()]
     .sort((a, b) => (b.lastTs || 0) - (a.lastTs || 0))
@@ -215,7 +216,7 @@ app.get("/threads", (req, res) => {
   res.json(out);
 });
 
-// ===== Messages (paginado; memória desta execução) =====
+// ===== Messages (snapshot desta execução; paginado) =====
 app.get("/messages", (req, res) => {
   const { chatId, cursor = "0", pageSize = "50" } = req.query;
   const all = Messages.get(chatId) || [];
@@ -226,7 +227,7 @@ app.get("/messages", (req, res) => {
   res.json({ items: slice, nextCursor });
 });
 
-// ===== Media proxy (para exibir imagens/avatares via proxy) =====
+// ===== Media proxy =====
 app.get("/media", async (req, res) => {
   try {
     const { url } = req.query;
