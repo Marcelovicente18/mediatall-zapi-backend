@@ -78,6 +78,65 @@ app.get("/messages", (req, res) => {
   const nextCursor = end < all.length ? String(end) : null;
   res.json({ items: slice, nextCursor });
 });
+// === Webhook robusto (aceita formatos diferentes) ===
+function normalizeIncoming(b) {
+  if (!b) return [];
+  if (b.type === "message" && b.message) return [b.message];
+  if (Array.isArray(b.messages)) return b.messages;
+  if (b.event === "message" && b.data) return Array.isArray(b.data) ? b.data : [b.data];
+  if (b.chatId && (b.body || b.text || b.caption)) return [b];
+  if (b.msg && (b.msg.chatId || b.msg.from)) return [b.msg];
+  return [];
+}
+
+app.post("/webhook/zapi", async (req, res) => {
+  try {
+    const incoming = normalizeIncoming(req.body || {});
+    if (!incoming.length) return res.json({ ok: true, ignored: true });
+
+    for (const m of incoming) {
+      const chatId = m.chatId || m.from || m.jid;
+      if (!chatId) continue;
+
+      const phone    = (typeof chatId === "string" ? chatId.split("@")[0] : "") || "";
+      const name     = m.senderName || m.pushname || phone;
+      const ts       = (Number(m.timestamp || m.t) * 1000) || Date.now();
+      const type     = m.type || m.messageType || (m.imageUrl ? "image" : "chat");
+      const text     = m.body || m.text || m.caption || "";
+      const mediaUrl = m.mediaUrl || m.imageUrl || m.documentUrl || null;
+      const avatarUrl= m.senderProfilePicUrl || m.profilePicUrl || null;
+
+      const previewText = (type === "chat")
+        ? (text || "").slice(0,120)
+        : `[${type}] ${(text || "").slice(0,80)}`;
+
+      upsertChat({ chatId, name, phone, ts, avatarUrl, preview: { type, text: previewText } });
+
+      const id = m.id || m.key?.id || `${chatId}-${ts}`;
+      pushMessage(chatId, { id, chatId, fromMe: !!m.fromMe, type, text, mediaUrl, ts });
+    }
+    res.json({ ok: true, count: incoming.length });
+  } catch (e) {
+    console.error("Webhook error:", e);
+    res.json({ ok: true });
+  }
+});
+
+// === Proxy de mídia/avatares ===
+app.get("/media", async (req, res) => {
+  try {
+    const { url } = req.query;
+    if (!url) return res.status(400).send("missing url");
+    const upstream = await fetch(url);
+    if (!upstream.ok) return res.status(502).send("bad gateway");
+    const ct = upstream.headers.get("content-type") || "application/octet-stream";
+    res.setHeader("Content-Type", ct);
+    const buf = Buffer.from(await upstream.arrayBuffer());
+    res.end(buf);
+  } catch (e) {
+    res.status(500).send("media error");
+  }
+});
 
 export default app;
 
