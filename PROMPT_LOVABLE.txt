@@ -1,0 +1,27 @@
+
+Use {API_BASE} como backend (Z-API via meu servidor). Operação SOMENTE LEITURA.
+
+Tela “Conversas”:
+- Buscar lista em GET {API_BASE}/threads.
+- Renderizar:
+  - Avatar real: quando item.avatar.type == "proxy", usar Image source = {API_BASE}/media?url={encodeURIComponent(item.avatar.url)}; se falhar, mostrar iniciais.
+  - Título: item.name
+  - Subtítulo (pré-visualização): item.preview?.text (1 linha, com reticências)
+  - Horário: formatar item.lastTs (24h)
+- Pull-to-refresh e auto refresh a cada 30s.
+- Ao tocar, abrir “Mensagens” passando chatId e phone.
+
+Tela “Mensagens”:
+- Carregar histórico paginado:
+  - GET {API_BASE}/messages?chatId={chatId}&cursor=0&pageSize=50
+  - Paginação infinita: se nextCursor existir, buscar mais ao rolar.
+- Renderização:
+  - type "chat": mostrar text em balão.
+  - type "image": usar Image com source = {API_BASE}/media?url={encodeURIComponent(item.mediaUrl)}.
+  - type "document": card com botão “Abrir”.
+- Rodapé: sem enviar (somente leitura). Mostrar botão “Abrir no WhatsApp” (wa.me/{phone}).
+- Usar message.id como chave única (não duplicar).
+
+Regras gerais:
+- Mostrar selo “WhatsApp conectado” se GET {API_BASE}/health retornar ok.
+- Em erro de imagem, exibir placeholder/iniciais.
