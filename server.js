@@ -1,27 +1,27 @@
 
+// server.js — Mediatall Z-API Backend (Vercel, Node 18+)
+
 import express from "express";
 import cors from "cors";
 
-// Uses Node 18+ global fetch (no node-fetch dependency)
+// Node 18+ já tem fetch global
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: "10mb" }));
 
 // ====== ENV ======
-// Example:
-// ZAPI_BASE=https://api.z-api.io/instances/INSTANCE_ID
-// ZAPI_TOKEN=YOUR_TOKEN
-// AUTH_TOKEN=someStrongSecret   (optional)
-// READ_ONLY=1                   (recommended to reduce risk; disables /send)
-const ZAPI_BASE = process.env.ZAPI_BASE;
+// ZAPI_BASE: ex. https://api.z-api.io/instances/SEU_INSTANCE_ID
+// ZAPI_TOKEN: token da sua instância
+// AUTH_TOKEN: opcional, protege rotas administrativas
+// READ_ONLY: defina "1" para desabilitar /send (somente leitura)
+const ZAPI_BASE  = process.env.ZAPI_BASE;
 const ZAPI_TOKEN = process.env.ZAPI_TOKEN;
 const AUTH_TOKEN = process.env.AUTH_TOKEN || "";
-const READ_ONLY = process.env.READ_ONLY === "1";
+const READ_ONLY  = process.env.READ_ONLY === "1";
 
-// Simple in-memory storage (OK to start).
-// For persistence, wire these writes to Supabase or a DB.
-const Chats = new Map();     // chatId -> { chatId, name, phone, lastTs, avatarUrl, preview }
-const Messages = new Map();  // chatId -> [ { id, fromMe, type, text, mediaUrl, ts } ]
+// ====== STORAGE EM MEMÓRIA (ok p/ começar) ======
+const Chats    = new Map(); // chatId -> { chatId, name, phone, lastTs, avatarUrl, preview }
+const Messages = new Map(); // chatId -> [ { id, fromMe, type, text, mediaUrl, ts } ]
 
 function upsertChat({ chatId, name, phone, ts, avatarUrl, preview }) {
   const prev = Chats.get(chatId) || { chatId };
@@ -38,8 +38,8 @@ function upsertChat({ chatId, name, phone, ts, avatarUrl, preview }) {
 function pushMessage(chatId, msg) {
   if (!Messages.has(chatId)) Messages.set(chatId, []);
   const arr = Messages.get(chatId);
-  if (arr.find(x => x.id === msg.id)) return; // avoid dup
-  arr.unshift(msg); // newest first
+  if (arr.find(x => x.id === msg.id)) return; // evita duplicar
+  arr.unshift(msg); // mais novas primeiro
 }
 
 function requireAuth(req, res, next) {
@@ -48,32 +48,92 @@ function requireAuth(req, res, next) {
   return res.status(401).json({ ok: false, error: "unauthorized" });
 }
 
-// Health check
+// ====== HEALTH ======
 app.get("/health", (req, res) => res.json({ ok: true }));
 
-// ========== Webhook from Z-API ==========
+// ====== HELPERS ROBUSTOS (Z-API pode variar por plano/versão) ======
+async function zGetJson(url) {
+  const r = await fetch(url);
+  let body = null;
+  try { body = await r.json(); } catch {}
+  if (!r.ok) {
+    const info = body ? JSON.stringify(body) : await r.text().catch(()=>"(no body)");
+    throw new Error(`ZAPI GET ${url} -> ${r.status} ${info}`);
+  }
+  return body;
+}
+
+// Tenta múltiplos endpoints para listar chats e normaliza o formato
+async function fetchAllChats() {
+  const base  = `${ZAPI_BASE}`;
+  const token = `token=${ZAPI_TOKEN}`;
+
+  const candidates = [
+    `${base}/chats?${token}`,
+    `${base}/client/chats?${token}`,
+    `${base}/contacts?${token}`
+  ];
+
+  for (const url of candidates) {
+    try {
+      const data = await zGetJson(url);
+      // pode vir {chats:[...]} | {contacts:[...]} | {items:[...]} | [...]
+      const arr = Array.isArray(data) ? data : (data.chats || data.contacts || data.items || []);
+      if (Array.isArray(arr)) return arr;
+    } catch (e) {
+      // tenta próximo
+    }
+  }
+  throw new Error("Não consegui listar chats: todos endpoints candidatos falharam.");
+}
+
+// Lista mensagens de um chat (paginado) aceitando formatos diferentes
+async function fetchMessagesForChat(chatId, limit = 200, cursor = null) {
+  const base  = `${ZAPI_BASE}`;
+  const token = `token=${ZAPI_TOKEN}`;
+  const qs = `${token}&chatId=${encodeURIComponent(chatId)}&limit=${limit}${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""}`;
+
+  const candidates = [
+    `${base}/messages?${qs}`,
+    `${base}/client/messages?${qs}`
+  ];
+
+  for (const url of candidates) {
+    try {
+      const data = await zGetJson(url);
+      // pode vir {messages:[...], nextCursor} | {items:[...]} | [...]
+      const messages = Array.isArray(data) ? data : (data.messages || data.items || []);
+      const nextCursor = data.nextCursor || null;
+      return { messages, nextCursor };
+    } catch (e) {
+      // tenta próximo
+    }
+  }
+  // se nada funcionar, retorna vazio sem quebrar
+  return { messages: [], nextCursor: null };
+}
+
+// ====== WEBHOOK: mensagens novas da Z-API ======
 app.post("/webhook/zapi", async (req, res) => {
   try {
     const e = req.body;
-    // Expecting { type: "message", message: {...} } but providers vary.
     if (e?.type !== "message" || !e.message) {
       return res.json({ ok: true });
     }
     const m = e.message;
-    const chatId = m.chatId;              // e.g., "5598987654321@c.us"
+    const chatId = m.chatId || m.from || m.jid; // cobre variações
     if (!chatId) return res.json({ ok: true });
-    const phone = chatId.split("@")[0];
-    const name = m.senderName || phone;
-    const ts = (Number(m.timestamp) * 1000) || Date.now();
-    const type = m.type;                  // "chat","image","document","audio","sticker",...
-    const text = m.body || "";
-    const mediaUrl = m.mediaUrl || null;
-    const avatarUrl = m.senderProfilePicUrl || null; // optional; may be missing
 
-    // Build preview text
-    const previewText = (type === "chat")
-      ? (text || "").slice(0, 120)
-      : `[${type}] ${(text || "").slice(0, 80)}`;
+    const phone = (typeof chatId === "string" ? chatId.split("@")[0] : "") || "";
+    const name  = m.senderName || m.pushname || phone;
+    const ts    = (Number(m.timestamp || m.t) * 1000) || Date.now();
+    const type  = m.type || m.messageType || (m.imageUrl ? "image" : "chat");
+    const text  = m.body || m.text || m.caption || "";
+    const mediaUrl  = m.mediaUrl || m.imageUrl || m.documentUrl || null;
+    const avatarUrl = m.senderProfilePicUrl || m.profilePicUrl || null;
+
+    const previewText = (type === "chat") ? (text || "").slice(0,120)
+                                          : `[${type}] ${(text || "").slice(0,80)}`;
 
     upsertChat({
       chatId, name, phone, ts, avatarUrl,
@@ -81,7 +141,7 @@ app.post("/webhook/zapi", async (req, res) => {
     });
 
     pushMessage(chatId, {
-      id: m.id,
+      id: m.id || m.key?.id,
       chatId,
       fromMe: !!m.fromMe,
       type,
@@ -97,58 +157,46 @@ app.post("/webhook/zapi", async (req, res) => {
   }
 });
 
-// ========== Backfill historical messages ==========
-// Call once after connection: POST /backfill  (with Authorization: Bearer AUTH_TOKEN)
+// ====== BACKFILL: puxar histórico antigo (chame 1x) ======
 app.post("/backfill", requireAuth, async (req, res) => {
   try {
     if (!ZAPI_BASE || !ZAPI_TOKEN) {
       return res.status(500).json({ ok: false, error: "Missing ZAPI_BASE or ZAPI_TOKEN env var." });
     }
-    // 1) fetch chats
-    const chatsResp = await fetch(`${ZAPI_BASE}/chats?token=${ZAPI_TOKEN}`);
-    const chats = await chatsResp.json();
 
-    for (const c of chats || []) {
-      const chatId = c.id;
+    // 1) listar chats (tentando vários endpoints)
+    const chats = await fetchAllChats();
+
+    for (const c of chats) {
+      const chatId = c.id || c.chatId || c.jid;
       if (!chatId) continue;
-      const phone = chatId.split("@")[0];
-      upsertChat({
-        chatId,
-        name: c.name || phone,
-        phone,
-        ts: Date.now(),
-        avatarUrl: c.profilePicUrl || null
-      });
 
-      // 2) paginate messages
+      const phone = (c.phone || (typeof chatId === "string" ? chatId.split("@")[0] : "")) || "";
+      const name  = c.name || c.pushname || phone;
+      const avatarUrl = c.profilePicUrl || c.avatarUrl || null;
+
+      upsertChat({ chatId, name, phone, ts: Date.now(), avatarUrl });
+
+      // 2) mensagens por chat (paginado)
       let cursor = null;
       do {
-        const url = `${ZAPI_BASE}/messages?token=${ZAPI_TOKEN}&chatId=${encodeURIComponent(chatId)}&limit=200${cursor ? `&cursor=${cursor}` : ""}`;
-        const pageResp = await fetch(url);
-        const page = await pageResp.json();
+        const page = await fetchMessagesForChat(chatId, 200, cursor);
+        for (const m of page.messages) {
+          const id   = m.id || m.key?.id;
+          if (!id) continue; // precisa de id p/ idempotência
 
-        for (const m of page?.messages || []) {
-          const msg = {
-            id: m.id,
-            chatId,
-            fromMe: !!m.fromMe,
-            type: m.type,
-            text: m.body || "",
-            mediaUrl: m.mediaUrl || null,
-            ts: (Number(m.timestamp) * 1000) || Date.now()
-          };
-          pushMessage(chatId, msg);
-          const prevTxt = (msg.type === "chat") ? (msg.text || "").slice(0, 120) : `[${msg.type}] ${(msg.text || "").slice(0, 80)}`;
-          upsertChat({
-            chatId,
-            name: c.name || phone,
-            phone,
-            ts: msg.ts,
-            preview: { type: msg.type, text: prevTxt }
-          });
+          const type = m.type || m.messageType || (m.imageUrl ? "image" : "chat");
+          const text = m.body || m.text || m.caption || "";
+          const mediaUrl = m.mediaUrl || m.imageUrl || m.documentUrl || null;
+          const ts   = (Number(m.timestamp || m.t) * 1000) || Date.now();
+
+          pushMessage(chatId, { id, chatId, fromMe: !!m.fromMe, type, text, mediaUrl, ts });
+
+          const previewText = (type === "chat") ? (text || "").slice(0,120)
+                                                : `[${type}] ${(text || "").slice(0,80)}`;
+          upsertChat({ chatId, name, phone, ts, preview: { type, text: previewText } });
         }
-
-        cursor = page?.nextCursor || null;
+        cursor = page.nextCursor || null;
       } while (cursor);
     }
 
@@ -159,13 +207,13 @@ app.post("/backfill", requireAuth, async (req, res) => {
   }
 });
 
-// ========== Threads for the app ==========
+// ====== THREADS ======
 app.get("/threads", (req, res) => {
   const out = [...Chats.values()]
     .sort((a, b) => (b.lastTs || 0) - (a.lastTs || 0))
     .map(c => {
       const phone = c.phone || (c.chatId?.split("@")[0] ?? "");
-      // Avatar: if we don't have one, use Z-API profile-pic endpoint
+      // Avatar: se não houver, usa endpoint de foto da Z-API
       let avatar = { type: "none" };
       if (c.avatarUrl) {
         avatar = { type: "proxy", url: c.avatarUrl };
@@ -186,7 +234,7 @@ app.get("/threads", (req, res) => {
   res.json(out);
 });
 
-// ========== Messages for a chat (paged) ==========
+// ====== MESSAGES ======
 app.get("/messages", (req, res) => {
   const { chatId, cursor = "0", pageSize = "50" } = req.query;
   const all = Messages.get(chatId) || [];
@@ -197,7 +245,7 @@ app.get("/messages", (req, res) => {
   res.json({ items: slice, nextCursor });
 });
 
-// ========== Optional send (kept disabled by default) ==========
+// ====== SEND (opcional; desabilitado se READ_ONLY=1) ======
 app.post("/send", requireAuth, async (req, res) => {
   try {
     if (READ_ONLY) {
@@ -221,7 +269,7 @@ app.post("/send", requireAuth, async (req, res) => {
   }
 });
 
-// ========== Media proxy (to render images/avatars in mobile) ==========
+// ====== MEDIA PROXY ======
 app.get("/media", async (req, res) => {
   try {
     const { url } = req.query;
@@ -230,7 +278,6 @@ app.get("/media", async (req, res) => {
     if (!upstream.ok) return res.status(502).send("bad gateway");
     const ct = upstream.headers.get("content-type") || "application/octet-stream";
     res.setHeader("Content-Type", ct);
-    // pipe the stream
     if (upstream.body && upstream.body.pipe) {
       upstream.body.pipe(res);
     } else {
@@ -242,10 +289,10 @@ app.get("/media", async (req, res) => {
   }
 });
 
-// Export the app for Vercel serverless
+// ====== EXPORT PARA VERCEL ======
 export default app;
 
-// Local dev (optional): only runs when not on Vercel
+// Dev local (opcional)
 if (process.env.NODE_ENV !== "production") {
   const port = process.env.PORT || 3000;
   app.listen(port, () => console.log("API on http://localhost:" + port));
