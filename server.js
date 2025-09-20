@@ -108,33 +108,44 @@ app.all(/^\/webhook\/zapi\/?$/, (req, res) => {
     }
 
     const incoming = normalizeIncoming(body || {});
-    for (const m of incoming) {
-      const chatId = m.chatId || m.from || m.jid;
-      if (!chatId) continue;
+    for (const m of incoming) {for (const m of incoming) {
+  // chatId: usa chatId/from/jid… ou deriva do phone
+  let chatId =
+    m.chatId || m.from || m.jid || m.remoteJid ||
+    (m.phone ? `${String(m.phone).replace(/\D/g, "")}@c.us` : null);
+  if (!chatId) continue;
 
-      const phone    = (typeof chatId === "string" ? chatId.split("@")[0] : "") || "";
-      const name     = m.senderName || m.pushname || m.name || phone;
-      const ts       = (Number(m.timestamp || m.t) * 1000) || Date.now();
-      const type     = m.type || m.messageType || (m.imageUrl ? "image" : "chat");
-      const text     = m.body || m.text || m.caption || "";
-      const mediaUrl = m.mediaUrl || m.imageUrl || m.documentUrl || null;
-      const avatarUrl= m.senderProfilePicUrl || m.profilePicUrl || m.avatarUrl || null;
+  const phone = (typeof chatId === "string" ? chatId.split("@")[0] : "") || (m.phone || "");
 
-      const previewText = (type === "chat")
-        ? (text || "").slice(0, 120)
-        : `[${type}] ${(text || "").slice(0, 80)}`;
+  // nome e avatar
+  const name  = m.senderName || m.chatName || m.name || phone;
+  const avatarUrl = m.senderPhoto || m.photo || m.profilePicUrl || m.avatarUrl || null;
 
-      upsertChat({ chatId, name, phone, ts, avatarUrl, preview: { type, text: previewText } });
+  // timestamp
+  const ts =
+    (m.moment && Number(m.moment)) ||
+    (m.timestamp && Number(m.timestamp) * 1000) ||
+    Date.now();
 
-      const id = m.id || m.key?.id || `${chatId}-${ts}`;
-      pushMessage(chatId, { id, chatId, fromMe: !!m.fromMe, type, text, mediaUrl, ts });
-    }
+  // tipo + texto
+  let type =
+    m.type === "ReceivedCallback" ? "chat" :
+    m.messageType || m.type || (m.imageUrl ? "image" : "chat");
 
-    res.json({ ok: true, received: Array.isArray(incoming) ? incoming.length : 0 });
-  } catch (e) {
-    console.error("Webhook error:", e);
-    // nunca 500 (para evitar re-tentativas infinitas do provedor)
-    res.json({ ok: true, handled: false });
+  let text =
+    m.body ||
+    (typeof m.text === "string" ? m.text : (m.text?.message || m.text?.caption || "")) ||
+    m.caption || "";
+
+  const mediaUrl = m.mediaUrl || m.imageUrl || m.documentUrl || null;
+
+  const previewText =
+    type === "chat" ? (text || "").slice(0, 120) : `[${type}] ${(text || "").slice(0, 80)}`;
+
+  upsertChat({ chatId, name, phone, ts, avatarUrl, preview: { type, text: previewText } });
+
+  const id = m.id || m.messageId || m.key?.id || `${chatId}-${ts}`;
+  pushMessage(chatId, { id, chatId, fromMe: !!m.fromMe, type, text, mediaUrl, ts });
   }
 });
 
