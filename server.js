@@ -52,21 +52,42 @@ function requireAuth(req, res, next) {
 app.get("/health", (req, res) => res.json({ ok: true }));
 
 // --------- Normalizador de payloads ----------
-function normalizeIncoming(b) {
+function normalizeIncoming(b) {function normalizeIncoming(b) {
   if (!b) return [];
-  // alguns provedores mandam string JSON no body (quando x-www-form-urlencoded)
   if (typeof b === "string") {
-    try { b = JSON.parse(b); } catch { /* deixa como está */ }
+    try { b = JSON.parse(b); } catch {}
   }
 
   // formatos comuns
   if (b.type === "message" && b.message) return [b.message];
   if (Array.isArray(b.messages)) return b.messages;
   if (b.event === "message" && b.data) return Array.isArray(b.data) ? b.data : [b.data];
-  if (b.chatId && (b.body || b.text || b.caption)) return [b];
+  if (b.chatId && (b.body || b.text || b.caption || b.imageUrl || b.documentUrl)) return [b];
   if (b.msg && (b.msg.chatId || b.msg.from)) return [b.msg];
 
-  return [];
+  // callbacks da Z-API (phone + text.message)
+  if (b.type === "ReceivedCallback" || b.phone || (b.text && typeof b.text === "object")) {
+    return [b];
+  }
+
+  // varredura recursiva: acha objetos com id + conteúdo
+  const out = [];
+  (function walk(x) {
+    if (!x || typeof x !== "object") return;
+    const hasId =
+      x.chatId || x.from || x.jid || x.remoteJid || x.phone;
+    const hasContent =
+      x.body ||
+      typeof x.text === "string" ||
+      (x.text && typeof x.text === "object" && (x.text.message || x.text.caption)) ||
+      x.caption ||
+      x.imageUrl ||
+      x.documentUrl;
+    if (hasId && hasContent) out.push(x);
+    for (const k of Object.keys(x)) walk(x[k]);
+  })(b);
+
+  return out;
 }
 
 // --------- Webhook robusto (aceita GET/POST, com/sem / no fim) ----------
